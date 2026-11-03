@@ -550,23 +550,57 @@ function getLog(dateStr, create) {
 }
 
 /* ---------------- 11. AI 解析（可选，OpenAI 兼容接口） ---------------- */
-async function aiParse(text) {
+// 把用户填写的地址规范化为完整的 /chat/completions 接口地址
+function buildAiUrl(raw) {
+  let u = raw.trim().replace(/\/+$/, '');
+  if (u.includes('/chat/completions')) return u;                    // 已是完整接口地址
+  if (/\/(v\d+[a-z]*|openai)/.test(u)) return u + '/chat/completions'; // 已含版本段，如 /v1、/v1beta、/openai
+  return u + '/v1/chat/completions';                                // 只填了域名，自动补 /v1
+}
+
+// 发起一次 OpenAI 兼容对话请求，出错时给出可读、可定位的原因
+async function aiChat(messages, temperature, maxTokens) {
   const cfg = state.ai;
-  let url = cfg.apiUrl.trim().replace(/\/+$/, '');
-  if (!url.includes('/chat/completions')) url += '/chat/completions';
-  const sys = '你是饮食记录解析助手。把用户的中文饮食描述解析为 JSON 数组，每个元素形如 {"name":"食物名","qty":数量数字,"unit":"碗|杯|个|片|份|盘|根|块|克|毫升 等","meal":"breakfast|lunch|dinner|snack"}。数量为数字，保留"无糖"等修饰进 name。只输出 JSON 数组，不要输出其他内容。';
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.apiKey },
-    body: JSON.stringify({
-      model: cfg.model || 'gpt-4o-mini',
-      messages: [{ role: 'system', content: sys }, { role: 'user', content: text }],
-      temperature: 0,
-    }),
-  });
-  if (!res.ok) throw new Error('AI 服务返回 ' + res.status);
+  if (!cfg.apiUrl || !cfg.apiKey) throw new Error('请先在设置页填写 API 地址和 Key，并点击"保存 AI 设置"');
+  const url = buildAiUrl(cfg.apiUrl);
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.apiKey },
+      body: JSON.stringify(Object.assign(
+        { model: cfg.model || 'gpt-4o-mini', messages, temperature },
+        maxTokens ? { max_tokens: maxTokens } : {},
+      )),
+    });
+  } catch (e) {
+    if (location.protocol === 'https:' && url.startsWith('http://')) {
+      throw new Error('页面是 HTTPS 而 API 地址是 HTTP，浏览器已拦截。请把 API 地址改为 https:// 开头');
+    }
+    throw new Error('无法连接到 API（网络错误或跨域 CORS 被拦截）。请确认：① 地址能访问；② 该服务商允许浏览器网页直接调用；③ 如服务商不允许，需要使用支持 CORS 的服务商或自建代理');
+  }
+  if (!res.ok) {
+    let detail = '';
+    try { const j = await res.json(); detail = (j.error && (j.error.message || j.error.code)) || JSON.stringify(j).slice(0, 160); }
+    catch (e2) { detail = ''; }
+    const hints = {
+      400: '请求参数不被接受（常见：模型名不对）',
+      401: 'API Key 无效或未生效',
+      403: '该 Key 无权限访问此模型或接口',
+      404: '接口路径不对，请检查 API 地址（通常应以 /v1/chat/completions 结尾）',
+      429: '调用过于频繁或额度已用完',
+    };
+    throw new Error(`HTTP ${res.status}：${hints[res.status] || '请求失败'}${detail ? ' —— ' + detail : ''}`);
+  }
   const data = await res.json();
   const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content || '';
+  if (!content) throw new Error('API 返回了空内容，请检查模型名是否正确');
+  return content;
+}
+
+async function aiParse(text) {
+  const sys = '你是饮食记录解析助手。把用户的中文饮食描述解析为 JSON 数组，每个元素形如 {"name":"食物名","qty":数量数字,"unit":"碗|杯|个|片|份|盘|根|块|克|毫升 等","meal":"breakfast|lunch|dinner|snack"}。数量为数字，保留"无糖"等修饰进 name。只输出 JSON 数组，不要输出其他内容。';
+  const content = await aiChat([{ role: 'system', content: sys }, { role: 'user', content: text }], 0);
   const m = content.match(/\[[\s\S]*\]/);
   if (!m) throw new Error('AI 返回格式无法识别');
   const arr = JSON.parse(m[0]);
@@ -577,20 +611,10 @@ async function aiParse(text) {
   }));
 }
 async function aiSuggestions(evalResult, agg, targets) {
-  const cfg = state.ai;
-  let url = cfg.apiUrl.trim().replace(/\/+$/, '');
-  if (!url.includes('/chat/completions')) url += '/chat/completions';
   const dims = Object.keys(SCORING_RULES).map(k => `${SCORING_RULES[k].name}:${dims_get(evalResult, k)}`).join('；');
   const sys = '你是营养科普助手。基于用户当天的饮食汇总与评分，输出不超过 5 条 JSON 建议数组，每条形如 {"title":"短标题","why":"为什么（结合数据，40字内）","how":"具体怎么做（50字内，可执行）"}。语气友好不说教，不给医疗建议，不做极端节食建议。只输出 JSON 数组。';
   const user = `摄入汇总：热量 ${agg.kcal} kcal（目标 ${targets.kcal}），蛋白质 ${agg.protein} g（目标 ${targets.protein}），蔬菜 ${agg.veg} g，水果 ${agg.fruit} g，膳食纤维 ${agg.fiber} g，钠 ${agg.sodium} mg，添加糖 ${agg.addedSugar} g。分项评分：${dims}。`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.apiKey },
-    body: JSON.stringify({ model: cfg.model || 'gpt-4o-mini', messages: [{ role: 'system', content: sys }, { role: 'user', content: user }], temperature: 0.3 }),
-  });
-  if (!res.ok) throw new Error('AI 服务返回 ' + res.status);
-  const data = await res.json();
-  const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content || '';
+  const content = await aiChat([{ role: 'system', content: sys }, { role: 'user', content: user }], 0.3);
   const m = content.match(/\[[\s\S]*\]/);
   if (!m) throw new Error('AI 返回格式无法识别');
   return JSON.parse(m[0]).slice(0, 5).map(x => ({ title: String(x.title || '建议'), why: String(x.why || ''), how: String(x.how || '') }));
@@ -890,10 +914,15 @@ function renderSettings() {
     <div class="row wrap gap">
       <label class="check"><input type="checkbox" id="aiEnabled" ${ai.enabled ? 'checked' : ''}> 启用 AI</label>
     </div>
-    <label class="small block">API 地址（OpenAI 兼容，如 https://api.xxx.com/v1/chat/completions）<input id="aiUrl" class="input" value="${esc(ai.apiUrl)}" placeholder="https://api.xxx.com/v1"></label>
+    <label class="small block">API 地址（OpenAI 兼容，如 https://api.deepseek.com/v1 或 https://api.xxx.com/v1/chat/completions）<input id="aiUrl" class="input" value="${esc(ai.apiUrl)}" placeholder="https://api.deepseek.com/v1"></label>
     <label class="small block">API Key<input id="aiKey" class="input" type="password" value="${esc(ai.apiKey)}" placeholder="仅存在本地浏览器"></label>
-    <label class="small block">模型名（可选）<input id="aiModel" class="input" value="${esc(ai.model)}" placeholder="如 gpt-4o-mini"></label>
-    <button class="btn primary" onclick="app.saveAI()">保存 AI 设置</button>
+    <label class="small block">模型名（可选，需与服务商一致，如 deepseek-chat、gpt-4o-mini）<input id="aiModel" class="input" value="${esc(ai.model)}" placeholder="如 deepseek-chat"></label>
+    <div class="row gap">
+      <button class="btn primary" onclick="app.saveAI()">保存 AI 设置</button>
+      <button class="btn ghost" onclick="app.testConnection()">测试连接</button>
+    </div>
+    <p class="muted small">填法示例：DeepSeek 填 <b>https://api.deepseek.com/v1</b> + 模型 <b>deepseek-chat</b>；通义千问填 <b>https://dashscope.aliyuncs.com/compatible-mode/v1</b> + 模型 <b>qwen-plus</b>。只填域名也可以，会自动补全 /v1/chat/completions。保存后请点"测试连接"。</p>
+    <p class="muted small" id="testResult"></p>
   </div>
 
   <div class="card">
@@ -929,7 +958,7 @@ const app = {
     if (state.ai.enabled && state.ai.apiUrl && state.ai.apiKey) {
       aiLoading = true; render();
       try { apply(await aiParse(text)); }
-      catch (e) { aiLoading = false; apply(localParse(text)); toast('AI 解析失败，已改用本地规则', true); }
+      catch (e) { aiLoading = false; apply(localParse(text)); toast('AI 解析失败，已改用本地规则：' + String(e.message || e).slice(0, 90), true); }
       aiLoading = false;
     } else {
       apply(localParse(text));
@@ -1041,6 +1070,32 @@ const app = {
     toast(state.ai.enabled && state.ai.apiUrl && state.ai.apiKey ? 'AI 已启用' : 'AI 未完整配置，将使用本地规则');
   },
 
+  // 连接测试：读取表单当前值（无需先保存），发一条极小请求并显示真实结果
+  async testConnection() {
+    const el = document.getElementById('testResult');
+    const get = id => { const e = document.getElementById(id); return e ? e.value.trim() : ''; };
+    if (el) el.textContent = '测试中…';
+    const saved = state.ai;
+    state.ai = {
+      enabled: true,
+      apiUrl: get('aiUrl') || saved.apiUrl,
+      apiKey: get('aiKey') || saved.apiKey,
+      model: get('aiModel') || saved.model,
+    };
+    try {
+      const url = buildAiUrl(state.ai.apiUrl);
+      const content = await aiChat([{ role: 'user', content: '回复"OK"两个字' }], 0, 10);
+      if (el) el.innerHTML = `<span style="color:var(--primary)">✔ 连接成功（${esc(url)}）—— 模型回复：${esc(content.slice(0, 40))}</span>`;
+      toast('AI 连接测试成功');
+    } catch (e) {
+      const msg = String(e.message || e);
+      if (el) el.innerHTML = `<span style="color:var(--danger)">✘ ${esc(msg)}</span>`;
+      toast('连接测试未通过，原因见下方说明', true);
+    } finally {
+      state.ai = saved;
+    }
+  },
+
   async genAiSugg() {
     const date = state.currentDate || todayStr();
     const log = getLog(date, false); if (!log) return;
@@ -1055,7 +1110,7 @@ const app = {
       log.evaluation.aiSuggestions = list;
       saveState(); render(); toast('AI 建议已生成');
     } catch (e) {
-      saveState(); render(); toast('AI 建议生成失败，已显示规则建议', true);
+      saveState(); render(); toast('AI 建议生成失败，已显示规则建议：' + String(e.message || e).slice(0, 90), true);
     }
   },
 
