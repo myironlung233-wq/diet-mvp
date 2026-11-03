@@ -599,7 +599,7 @@ async function aiChat(messages, temperature, maxTokens) {
 }
 
 async function aiParse(text) {
-  const sys = '你是饮食记录解析助手。把用户的中文饮食描述解析为 JSON 数组，每个元素形如 {"name":"食物名","qty":数量数字,"unit":"碗|杯|个|片|份|盘|根|块|克|毫升 等","meal":"breakfast|lunch|dinner|snack"}。数量为数字，保留"无糖"等修饰进 name。只输出 JSON 数组，不要输出其他内容。';
+  const sys = '你是饮食记录解析助手。把用户的中文饮食描述解析为 JSON 数组，每个元素形如 {"name":"食物名","qty":数量数字,"unit":"碗|杯|个|片|份|盘|根|块|克|毫升 等","meal":"breakfast|lunch|dinner|snack","kcal":该份食物总热量估算,"protein":蛋白质克数,"carb":碳水克数,"fat":脂肪克数,"fiber":膳食纤维克数,"sodium":钠毫克,"sugar":糖克数,"allergens":["牛奶","鸡蛋","花生","坚果","大豆","小麦(麸质)","鱼","虾/贝类"]中可能相关的子集}。kcal 等营养是这一份（qty×unit）总量的常识估算数字；保留"无糖"等修饰进 name；allergens 没有则为空数组。只输出 JSON 数组，不要输出其他内容。';
   const content = await aiChat([{ role: 'system', content: sys }, { role: 'user', content: text }], 0);
   const m = content.match(/\[[\s\S]*\]/);
   if (!m) throw new Error('AI 返回格式无法识别');
@@ -608,7 +608,27 @@ async function aiParse(text) {
     name: String(x.name), qty: Number(x.qty) > 0 ? Number(x.qty) : 1,
     unit: UNITS.includes(x.unit) ? x.unit : '份',
     meal: MEAL_ORDER.includes(x.meal) ? x.meal : 'lunch', noSugar: /无糖/.test(x.name), raw: String(x.name),
+    kcal: x.kcal, protein: x.protein, carb: x.carb, fat: x.fat, fiber: x.fiber, sodium: x.sodium, sugar: x.sugar,
+    allergens: Array.isArray(x.allergens) ? x.allergens : [],
   }));
+}
+
+// AI 解析结果 → 食物条目：命中本地食物库则用库内营养（更一致）；
+// 库外食物直接采用 AI 估算的营养，不再标记"待确认"
+function makeAiItem(parsed) {
+  if (matchFood(parsed.name)) return makeItem(parsed);
+  const n = v => { const x = Number(v); return isFinite(x) && x > 0 ? x : 0; };
+  const kcal = n(parsed.kcal);
+  return {
+    id: uid(), name: parsed.name, meal: parsed.meal, qty: parsed.qty, unit: parsed.unit,
+    raw: parsed.raw || '', estimated: true, pending: kcal <= 0, food: null,
+    note: kcal > 0 ? '营养为 AI 估算' : 'AI 未给出营养，请手动填写',
+    allergens: Array.isArray(parsed.allergens) ? parsed.allergens.filter(a => ALLERGEN_LIST.includes(a)) : [],
+    flags: {}, grams: 0,
+    kcal: Math.round(kcal),
+    protein: round1(n(parsed.protein)), carb: round1(n(parsed.carb)), fat: round1(n(parsed.fat)),
+    fiber: round1(n(parsed.fiber)), sodium: Math.round(n(parsed.sodium)), sugar: round1(n(parsed.sugar)),
+  };
 }
 async function aiSuggestions(evalResult, agg, targets) {
   const dims = Object.keys(SCORING_RULES).map(k => `${SCORING_RULES[k].name}:${dims_get(evalResult, k)}`).join('；');
@@ -943,11 +963,11 @@ const app = {
     const text = (el.value || '').trim();
     if (!text) { toast('先输入今天吃了什么吧', true); return; }
     const override = document.getElementById('nlMeal').value;
-    const apply = (list) => {
+    const apply = (list, fromAi) => {
       let added = 0, pending = 0;
       const log = getLog(state.currentDate || todayStr(), true);
       for (const p of list) {
-        const item = makeItem({ ...p, meal: override || p.meal });
+        const item = (fromAi ? makeAiItem : makeItem)({ ...p, meal: override || p.meal });
         log.meals[item.meal].push(item);
         added++; if (item.pending) pending++;
       }
@@ -957,7 +977,7 @@ const app = {
     };
     if (state.ai.enabled && state.ai.apiUrl && state.ai.apiKey) {
       aiLoading = true; render();
-      try { apply(await aiParse(text)); }
+      try { apply(await aiParse(text), true); }
       catch (e) { aiLoading = false; apply(localParse(text)); toast('AI 解析失败，已改用本地规则：' + String(e.message || e).slice(0, 90), true); }
       aiLoading = false;
     } else {
